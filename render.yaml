@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: treasure-hunt-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        value: "8408074707:AAEe7miladjgSS4RyoxDNHFTdtgqfIJ0Fvc"
