@@ -13,11 +13,7 @@ from telegram.ext import (
 # -----------------------
 # Basic Config
 # -----------------------
-BOT_TOKEN = os.getenv("8408074707:AAEe7miladjgSS4RyoxDNHFTdtgqfIJ0Fvc
-
-")
-if not BOT_TOKEN:
-    raise RuntimeError("Please set BOT_TOKEN environment variable.")
+BOT_TOKEN = "8408074707:AAEe7miladjgSS4RyoxDNHFTdtgqfIJ0Fvc"
 
 LETTERS = ["A", "B", "C", "D", "E"]
 NUMS = ["1", "2", "3", "4", "5"]
