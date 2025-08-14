@@ -1,377 +1,704 @@
+# main.py
+# Agent vs Mole — Telegram social-deduction (MVP)
+# WARNING: Keep your BOT_TOKEN secret. If you pasted it publicly, regenerate it via BotFather ASAP.
+
+import asyncio
+import json
 import os
 import random
 import string
-import asyncio
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import time
+from typing import Tuple
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler,
+    filters, CallbackQueryHandler
 )
 
-# -----------------------
-# Basic Config
-# -----------------------
+# -----------------
+# CONFIG (TOKEN)
+# -----------------
+# You provided this token in chat. IMPORTANT: After testing, regenerate a new token in BotFather
+# and replace it here (do NOT share it publicly).
 BOT_TOKEN = "8408074707:AAEe7miladjgSS4RyoxDNHFTdtgqfIJ0Fvc"
 
-LETTERS = ["A", "B", "C", "D", "E"]
-NUMS = ["1", "2", "3", "4", "5"]
-GRID_CELLS = {f"{r}{c}" for r in LETTERS for c in NUMS}
+DATA_FILE = "data.json"
+SAVE_INTERVAL = 10  # seconds
+BIG_MATCH_PLAYER_THRESHOLD = 7
+MEGA_VALUE_IN_NANO = 10_000
 
-TREASURES_PER_PLAYER = 3
-TRAPS_PER_PLAYER = 2
-START_HP = 3
-WIN_SCORE = 3
+# Reward values (can tweak)
+NANO_REWARD_SMALL_WIN = 50
+NANO_REWARD_SMALL_CONSOLE = 10
+MEGA_REWARD_BIG_WIN = 1
 
-# -----------------------
-# In-memory Game Store
-# -----------------------
-rooms: Dict[str, dict] = {}  # code -> room dict
-user_room: Dict[int, str] = {}  # user_id -> room code
+TASK_PHASE_SECONDS = 90
+MEETING_SECONDS = 60
+VOTE_SECONDS = 25
 
-def code4() -> str:
-    return "".join(random.choice(string.ascii_uppercase) for _ in range(4))
+SHOP_ITEMS = {
+    "A01": ("Sakura (Common)", 200, "nano"),
+    "A02": ("Kazuma (Common)", 200, "nano"),
+    "A03": ("Hinata (Uncommon)", 600, "nano"),
+    "A04": ("Levi (Rare)", 1, "mega"),
+    "A05": ("Zero-Two (Epic)", 2, "mega"),
+    "A06": ("Gojo (Legendary)", 3, "mega"),
+}
 
-def now() -> str:
-    return datetime.utcnow().strftime("%H:%M:%S")
+# -----------------
+# Persistence store
+# -----------------
+def now_ts() -> int:
+    return int(time.time())
 
-# -----------------------
-# Helpers
-# -----------------------
-def room_status_text(room: dict) -> str:
-    p1 = room["p1"]
-    p2 = room["p2"]
-    def ptxt(p):
-        return f"{p['name']} | Score {p['score']} | HP {p['hp']}"
-
-    phase = room["state"]
-    turn_name = "—"
-    if room.get("turn") in (p1["id"], p2["id"]):
-        turn_name = p1["name"] if room["turn"] == p1["id"] else p2["name"]
-
-    return (
-        f"Room {room['code']} | State: {phase}\n"
-        f"Turn: {turn_name}\n"
-        f"P1: {ptxt(p1)}\n"
-        f"P2: {ptxt(p2)}"
-    )
-
-def valid_cell(cell: str) -> bool:
-    return cell.upper() in GRID_CELLS
-
-def parse_cells(args: List[str]) -> Tuple[List[str], List[str]]:
-    """Return (valid, invalid) lists in upper case, without duplicates, keep order."""
-    seen = set()
-    valid, invalid = [], []
-    for a in args:
-        c = a.strip().upper()
-        if not c or c in seen:
-            continue
-        seen.add(c)
-        if valid_cell(c):
-            valid.append(c)
-        else:
-            invalid.append(c)
-    return valid, invalid
-
-def get_opponent(room: dict, user_id: int) -> dict:
-    return room["p2"] if room["p1"]["id"] == user_id else room["p1"]
-
-def get_player(room: dict, user_id: int) -> dict:
-    return room["p1"] if room["p1"]["id"] == user_id else room["p2"]
-
-def both_ready(room: dict) -> bool:
-    return room["p1"]["ready"] and room["p2"]["ready"]
-
-def ensure_user_in_room(user_id: int) -> Optional[dict]:
-    code = user_room.get(user_id)
-    if not code:
-        return None
-    return rooms.get(code)
-
-# -----------------------
-# Commands
-# -----------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to *2-Player Treasure Hunt*!\n\n"
-        "Quick guide:\n"
-        "1) /play → room banayen (code milega)\n"
-        "2) Doosra player /join CODE kare\n"
-        "3) Dono placement karein:\n"
-        f"   /place_treasures A1 A2 A3  (exact {TREASURES_PER_PLAYER})\n"
-        f"   /place_traps B4 C5        (exact {TRAPS_PER_PLAYER})\n"
-        "4) /ready likhen\n"
-        "5) Game start → turn par /guess B3 type karo\n\n"
-        "Status dekhne ko /status, resign ke liye /ff"
-    )
-
-async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # Agar user kisi room me hai, pehle wahaan se nikaal do
-    if user.id in user_room:
-        old = user_room[user.id]
-        rooms.pop(old, None)
-        for uid, rcode in list(user_room.items()):
-            if rcode == old:
-                user_room.pop(uid, None)
-
-    code = code4()
-    rooms[code] = {
-        "code": code,
-        "state": "waiting",  # waiting -> placing -> playing -> ended
-        "created": now(),
-        "p1": {
-            "id": user.id,
-            "name": user.first_name,
-            "hp": START_HP,
-            "score": 0,
-            "treasures": [],
-            "traps": [],
-            "guessed": set(),
-            "ready": False,
-        },
-        "p2": {
-            "id": None,
-            "name": "—",
-            "hp": START_HP,
-            "score": 0,
-            "treasures": [],
-            "traps": [],
-            "guessed": set(),
-            "ready": False,
-        },
-        "turn": None,
-        "log": [],
-    }
-    user_room[user.id] = code
-    await update.message.reply_text(
-        f"🆕 Room created: *{code}*\n"
-        "Dusra player is code se join kare: /join " + code
-    )
-
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not context.args:
-        return await update.message.reply_text("Usage: /join CODE")
-    code = context.args[0].upper()
-    room = rooms.get(code)
-    if not room or room["state"] != "waiting":
-        return await update.message.reply_text("Room not found ya already started.")
-    if room["p1"]["id"] == user.id:
-        return await update.message.reply_text("Aap already is room ke host ho.")
-
-    # Set p2
-    room["p2"]["id"] = user.id
-    room["p2"]["name"] = user.first_name
-    room["state"] = "placing"
-    user_room[user.id] = code
-
-    txt = (
-        f"👥 Match ready! Room {code}\n\n"
-        "Placement phase shuru:\n"
-        f"- Treasures set karo: /place_treasures A1 A2 A3  (exact {TREASURES_PER_PLAYER})\n"
-        f"- Traps set karo: /place_traps B4 C5            (exact {TRAPS_PER_PLAYER})\n"
-        "- Jab ho jaye to /ready likho"
-    )
-    # Notify both
-    for pid in (room["p1"]["id"], room["p2"]["id"]):
-        try:
-            await context.bot.send_message(chat_id=pid, text=txt)
-        except Exception:
-            pass
-
-async def place_treasures(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room or room["state"] != "placing":
-        return await update.message.reply_text("Aap placement phase me kisi room me nahi ho.")
-    cells, bad = parse_cells(context.args)
-    if bad:
-        return await update.message.reply_text(f"❌ Invalid cells: {' '.join(bad)}")
-    if len(cells) != TREASURES_PER_PLAYER:
-        return await update.message.reply_text(
-            f"Please exactly {TREASURES_PER_PLAYER} cells do, e.g. /place_treasures A1 B2 C3"
-        )
-    player = get_player(room, user.id)
-    if set(cells) & set(player.get("traps", [])):
-        return await update.message.reply_text("Treasure and trap same cell nahi ho sakte.")
-    player["treasures"] = cells
-    player["ready"] = False
-    await update.message.reply_text(f"✅ Treasures set: {' '.join(cells)}\nAb /place_traps karo.")
-
-async def place_traps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room or room["state"] != "placing":
-        return await update.message.reply_text("Aap placement phase me kisi room me nahi ho.")
-    cells, bad = parse_cells(context.args)
-    if bad:
-        return await update.message.reply_text(f"❌ Invalid cells: {' '.join(bad)}")
-    if len(cells) != TRAPS_PER_PLAYER:
-        return await update.message.reply_text(
-            f"Please exactly {TRAPS_PER_PLAYER} cells do, e.g. /place_traps A4 B5"
-        )
-    player = get_player(room, user.id)
-    if set(cells) & set(player.get("treasures", [])):
-        return await update.message.reply_text("Trap and treasure same cell nahi ho sakte.")
-    player["traps"] = cells
-    player["ready"] = False
-    await update.message.reply_text(f"✅ Traps set: {' '.join(cells)}\nAkhri step: /ready")
-
-async def ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room or room["state"] != "placing":
-        return await update.message.reply_text("Abhi ready karne ka time nahi hai.")
-    player = get_player(room, user.id)
-    if len(player["treasures"]) != TREASURES_PER_PLAYER or len(player["traps"]) != TRAPS_PER_PLAYER:
-        return await update.message.reply_text("Pehle treasures aur traps sahi se set karo.")
-    player["ready"] = True
-    await update.message.reply_text("✅ You are READY.")
-
-    if both_ready(room):
-        room["state"] = "playing"
-        # Randomly choose who starts
-        room["turn"] = random.choice([room["p1"]["id"], room["p2"]["id"]])
-        for pid in (room["p1"]["id"], room["p2"]["id"]):
+class Store:
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = asyncio.Lock()
+        # data model: players, groups, globalscore
+        self.data = {
+            "players": {},   # user_id -> profile
+            "groups": {},    # chat_id -> group game state
+            "globalscore": {} # user_id -> score
+        }
+        if os.path.exists(path):
             try:
-                await context.bot.send_message(
-                    chat_id=pid,
-                    text="🎮 Game start!\n"
-                         f"Turn: {get_player(room, room['turn'])['name']}\n"
-                         "Guess like: /guess B3"
+                with open(path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+            except Exception:
+                print("Warning: failed loading data.json — starting fresh.")
+
+    async def save_loop(self):
+        while True:
+            await asyncio.sleep(SAVE_INTERVAL)
+            await self.save()
+
+    async def save(self):
+        async with self.lock:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+
+    def pget(self, user_id: int) -> dict:
+        k = str(user_id)
+        p = self.data["players"].setdefault(k, {
+            "username": None,
+            "nano": 0,
+            "mega": 0,
+            "inventory": [],
+            "wins": 0,
+            "losses": 0,
+            "last_seen": now_ts(),
+        })
+        return p
+
+    def gget(self, chat_id: int) -> dict:
+        k = str(chat_id)
+        g = self.data["groups"].setdefault(k, {
+            "lobby": [],
+            "phase": "idle",
+            "round": 0,
+            "roles": {},
+            "alive": [],
+            "tasks": {},
+            "votes": {},
+            "meeting_caller": None,
+            "eliminated": [],
+            "host": None,
+            "game_started_ts": None,
+            "last_summary": "",
+        })
+        return g
+
+    def add_global_score(self, uid: int, delta: int):
+        k = str(uid)
+        self.data["globalscore"][k] = self.data["globalscore"].get(k, 0) + delta
+
+store = Store(DATA_FILE)
+
+# -----------------
+# Utilities & tasks
+# -----------------
+def mention(user) -> str:
+    name = user.full_name or (user.username or str(user.id))
+    return f"{name}"
+
+def choose_moles(n_players: int) -> int:
+    if n_players <= 6:
+        return 1
+    elif n_players <= 11:
+        return 2
+    else:
+        return max(3, n_players // 4)
+
+def is_big_match(n_players: int) -> bool:
+    return n_players >= BIG_MATCH_PLAYER_THRESHOLD
+
+def short_id(n=6) -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+def gen_task() -> Tuple[str, str]:
+    t = random.choice(["reverse", "odd", "math"])
+    if t == "reverse":
+        seq = "".join(random.choices("0123456789", k=4))
+        prompt = f"Memory: {seq} | Reply the reverse."
+        answer = seq[::-1]
+        return (prompt, answer)
+    if t == "odd":
+        words = random.sample(["red", "blue", "green", "cat", "yellow"], 4)
+        if "cat" not in words:
+            words[0] = "cat"
+        prompt = f"Odd-one-out: {', '.join(words)}"
+        answer = "cat"
+        return (prompt, answer)
+    a, b = random.randint(2,9), random.randint(2,9)
+    prompt = f"Compute: {a} + {b} = ?"
+    answer = str(a+b)
+    return (prompt, answer)
+
+# -----------------
+# Commands: core
+# -----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    p = store.pget(user.id)
+    p["username"] = user.username
+    p["last_seen"] = now_ts()
+    await update.message.reply_text(
+        "Welcome to Agent vs Mole!\n"
+        "Use /host (group) to create lobby, /join to join, /startgame to start.\n"
+        "Use /balance to check your Nano/Mega currency."
+    )
+
+async def host(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == Chat.PRIVATE:
+        await update.message.reply_text("Use /host in a group.")
+        return
+    g = store.gget(chat.id)
+    if g["phase"] != "idle":
+        await update.message.reply_text("Already a lobby/game active here.")
+        return
+    g["lobby"] = []
+    g["phase"] = "lobby"
+    g["host"] = update.effective_user.id
+    await update.message.reply_text(f"Lobby created. Host: {mention(update.effective_user)}\nPlayers: /join")
+
+async def join_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == Chat.PRIVATE:
+        await update.message.reply_text("Use /join in a group lobby.")
+        return
+    g = store.gget(chat.id)
+    if g["phase"] != "lobby":
+        await update.message.reply_text("No active lobby. Host one with /host")
+        return
+    if user.id in g["lobby"]:
+        await update.message.reply_text("You are already in the lobby.")
+        return
+    g["lobby"].append(user.id)
+    store.pget(user.id)["username"] = user.username
+    await update.message.reply_text(f"{mention(user)} joined. Players: {len(g['lobby'])}")
+
+async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == Chat.PRIVATE:
+        await update.message.reply_text("Start games in groups.")
+        return
+    g = store.gget(chat.id)
+    if g["phase"] != "lobby":
+        await update.message.reply_text("No lobby to start.")
+        return
+    if g["host"] != user.id:
+        await update.message.reply_text("Only host can start.")
+        return
+    if len(g["lobby"]) < 2:
+        await update.message.reply_text("Need at least 2 players.")
+        return
+
+    players = list(g["lobby"])
+    random.shuffle(players)
+    n = len(players)
+    n_moles = choose_moles(n)
+    mole_ids = set(random.sample(players, k=n_moles))
+    roles = {}
+    for pid in players:
+        roles[pid] = "mole" if pid in mole_ids else "agent"
+
+    g["roles"] = roles
+    g["alive"] = players.copy()
+    g["eliminated"] = []
+    g["round"] = 1
+    g["phase"] = "task"
+    g["votes"] = {}
+    g["tasks"] = {}
+    g["game_started_ts"] = now_ts()
+    g["last_summary"] = ""
+
+    # assign tasks & DM
+    for pid in players:
+        store.pget(pid)  # ensure exists
+        if roles[pid] == "agent":
+            assigned = []
+            for _ in range(2):
+                prompt, answer = gen_task()
+                assigned.append({"id": short_id(), "prompt": prompt, "answer": answer, "done": False})
+            g["tasks"][str(pid)] = {"assigned": assigned}
+            try:
+                await context.bot.send_message(pid,
+                    f"🔐 You are AGENT.\nComplete tasks within {TASK_PHASE_SECONDS}s.\n" +
+                    "\n".join([f"{t['id']}: {t['prompt']}" for t in assigned]) +
+                    "\nReply using: /solve <task_id> <answer>"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await context.bot.send_message(pid,
+                    f"🕵️ You are MOLE.\nYou can /sabotage <@username> once per round to reshuffle a task."
                 )
             except Exception:
                 pass
 
-async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Game started! Players: {n} | Moles: {n_moles}\nTask phase {TASK_PHASE_SECONDS}s started.")
+    context.job_queue.run_once(end_task_phase, TASK_PHASE_SECONDS, data={"chat_id": chat.id}, name=f"task_{chat.id}_{g['round']}")
+
+# /solve for tasks (DM from user)
+async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room or room["state"] != "playing":
-        return await update.message.reply_text("Koi running game nahi mila.")
-    if room["turn"] != user.id:
-        return await update.message.reply_text("Abhi aapka turn nahi hai.")
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /solve <task_id> <answer>")
+        return
+    task_id = args[0].strip()
+    answer = " ".join(args[1:]).strip()
 
-    if not context.args:
-        return await update.message.reply_text("Usage: /guess B3")
+    # find game where user is alive & in task phase
+    gid = None
+    for gid_s, gdata in store.data["groups"].items():
+        gdata_phase = gdata.get("phase")
+        if gdata_phase == "task" and user.id in gdata.get("alive", []):
+            gid = int(gid_s)
+            break
+    if not gid:
+        await update.message.reply_text("No active task-phase game found where you are alive.")
+        return
+    g = store.gget(gid)
+    if g["roles"].get(user.id) != "agent":
+        await update.message.reply_text("Only Agents have tasks.")
+        return
+    tasks = g["tasks"].get(str(user.id), {"assigned": []})["assigned"]
+    found = None
+    for t in tasks:
+        if t["id"].lower() == task_id.lower():
+            found = t
+            break
+    if not found:
+        await update.message.reply_text("Invalid task id.")
+        return
+    if found["done"]:
+        await update.message.reply_text("Task already completed.")
+        return
+    if answer.strip().lower() == found["answer"].strip().lower():
+        found["done"] = True
+        await update.message.reply_text("✅ Correct! Task completed.")
+    else:
+        await update.message.reply_text("❌ Wrong answer.")
 
-    cell = context.args[0].upper().strip()
-    if not valid_cell(cell):
-        return await update.message.reply_text("❌ Invalid cell. Example: A1..E5")
-
-    me = get_player(room, user.id)
-    opp = get_opponent(room, user.id)
-
-    if cell in me["guessed"]:
-        return await update.message.reply_text("Ye cell aap pehle try kar chuke ho. Doosra do.")
-    me["guessed"].add(cell)
-
-    result = "miss"
-    extra_turn = False
-    end_now = False
-
-    if cell in opp["treasures"]:
-        me["score"] += 1
-        result = "TREASURE ⭐ (+1 point)"
-        extra_turn = True
-        if me["score"] >= WIN_SCORE:
-            room["state"] = "ended"
-            end_now = True
-    elif cell in opp["traps"]:
-        me["hp"] -= 1
-        result = "TRAP 💥 (-1 HP)"
-        if me["hp"] <= 0:
-            room["state"] = "ended"
-            end_now = True
-
-    room["log"].append({"by": user.id, "cell": cell, "res": result, "ts": now()})
-
-    if end_now:
-        winner = me if me["hp"] > 0 or me["score"] >= WIN_SCORE else opp
-        msg = (
-            f"🔔 {user.first_name} guessed {cell}: {result}\n\n"
-            f"🏁 Game Over! Winner: {winner['name']}\n\n" + room_status_text(room)
-        )
-        for pid in (room["p1"]["id"], room["p2"]["id"]):
-            try:
-                await context.bot.send_message(chat_id=pid, text=msg)
-            except Exception:
-                pass
+# /sabotage for Mole
+async def sabotage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /sabotage <@username or user_id>")
+        return
+    # find game
+    gid = None
+    for gid_s, gdata in store.data["groups"].items():
+        if gdata.get("phase") == "task" and user.id in gdata.get("alive", []):
+            gid = int(gid_s)
+            break
+    if not gid:
+        await update.message.reply_text("No active task-phase or you are not in one.")
+        return
+    g = store.gget(gid)
+    if g["roles"].get(user.id) != "mole":
+        await update.message.reply_text("Only Moles can sabotage.")
         return
 
-    # Continue game
-    if not extra_turn:
-        room["turn"] = opp["id"]
-
-    msg_me = f"🎯 You guessed {cell}: {result}\n" + room_status_text(room)
-    msg_opp = f"⚠️ {me['name']} guessed {cell}: {result}\n" + room_status_text(room)
-    try:
-        await context.bot.send_message(chat_id=me["id"], text=msg_me)
-    except Exception:
-        pass
-    try:
-        await context.bot.send_message(chat_id=opp["id"], text=msg_opp)
-    except Exception:
-        pass
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room:
-        return await update.message.reply_text("Aap kisi room me nahi ho.")
-    await update.message.reply_text(room_status_text(room))
-
-async def ff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    room = ensure_user_in_room(user.id)
-    if not room:
-        return await update.message.reply_text("Koi room nahi mila.")
-    if room["state"] == "ended":
-        return await update.message.reply_text("Game already end ho chuka hai.")
-    opp = get_opponent(room, user.id)
-    room["state"] = "ended"
-    for pid in (room["p1"]["id"], room["p2"]["id"]):
+    target = args[0]
+    target_id = None
+    if target.startswith("@"):
+        uname = target[1:].lower()
+        for uid_s, pdata in store.data["players"].items():
+            if pdata.get("username") and pdata["username"].lower() == uname:
+                target_id = int(uid_s)
+                break
+    else:
         try:
-            await context.bot.send_message(
-                chat_id=pid,
-                text=f"🏳️ {user.first_name} resigned.\nWinner: {opp['name']}"
-            )
-        except Exception:
+            target_id = int(target)
+        except:
             pass
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not target_id or target_id not in g["alive"] or g["roles"].get(target_id) != "agent":
+        await update.message.reply_text("Target must be alive Agent in this game.")
+        return
+
+    tag = f"sab_{user.id}_{g['round']}"
+    if tag in g["last_summary"]:
+        await update.message.reply_text("You already sabotaged this round.")
+        return
+
+    tasks = g["tasks"].get(str(target_id), {"assigned": []})["assigned"]
+    idx_choices = [i for i,t in enumerate(tasks) if not t["done"]]
+    if not idx_choices:
+        await update.message.reply_text("Target has no incomplete tasks.")
+        return
+    idx = random.choice(idx_choices)
+    new_prompt, new_answer = gen_task()
+    tasks[idx] = {"id": short_id(), "prompt": new_prompt, "answer": new_answer, "done": False}
+    g["last_summary"] += " " + tag
+
+    await update.message.reply_text("Sabotage applied.")
+    try:
+        await context.bot.send_message(target_id, f"⚠️ A sabotage changed one of your tasks. Check DM for updated tasks.")
+    except:
+        pass
+
+# end of task phase -> meeting
+async def end_task_phase(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.data["chat_id"]
+    g = store.gget(chat_id)
+    if g["phase"] != "task":
+        return
+    total = 0
+    done = 0
+    for uid in g["alive"]:
+        if g["roles"].get(uid) == "agent":
+            tasks = g["tasks"].get(str(uid), {"assigned": []})["assigned"]
+            for t in tasks:
+                total += 1
+                if t["done"]:
+                    done += 1
+    g["phase"] = "meeting"
+    g["votes"] = {}
+    g["meeting_caller"] = "auto"
+    prog = f"{done}/{total}" if total else "0/0"
+    msg = (f"⏰ Task phase over.\nRound {g['round']} — Tasks completed: {prog}\n"
+           f"Meeting open for {MEETING_SECONDS}s. Discuss or /report to call meeting.")
+    await context.bot.send_message(chat_id, msg)
+    context.job_queue.run_once(start_vote_phase, MEETING_SECONDS, data={"chat_id": chat_id}, name=f"meet_{chat_id}_{g['round']}")
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    g = store.gget(chat.id)
+    if g["phase"] not in ("task", "meeting"):
+        await update.message.reply_text("You can only report during Task/Meeting.")
+        return
+    g["phase"] = "meeting"
+    g["meeting_caller"] = update.effective_user.id
+    await update.message.reply_text(f"📣 Meeting called by {mention(update.effective_user)}. Discussion for {MEETING_SECONDS}s.")
+    context.job_queue.run_once(start_vote_phase, MEETING_SECONDS, data={"chat_id": chat.id}, name=f"meet_{chat.id}_{g['round']}")
+
+async def start_vote_phase(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    g = store.gget(chat_id)
+    if g["phase"] != "meeting":
+        return
+    g["phase"] = "vote"
+    g["votes"] = {}
+    buttons = []
+    for uid in g["alive"]:
+        buttons.append([InlineKeyboardButton(f"Vote {uid}", callback_data=f"vote:{uid}")])
+    buttons.append([InlineKeyboardButton("Skip", callback_data="vote:skip")])
+    kb = InlineKeyboardMarkup(buttons)
+    await context.bot.send_message(chat_id, f"🗳️ Voting open for {VOTE_SECONDS}s. Tap to vote.", reply_markup=kb)
+    context.job_queue.run_once(end_vote_phase, VOTE_SECONDS, data={"chat_id": chat_id}, name=f"vote_{chat_id}_{g['round']}")
+
+async def on_vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if not data.startswith("vote:"):
+        return
+    chat = query.message.chat
+    g = store.gget(chat.id)
+    if g["phase"] != "vote":
+        await query.edit_message_text("Voting is not active.")
+        return
+    voter = query.from_user.id
+    if voter not in g["alive"]:
+        await query.answer("You are not alive.")
+        return
+    target = data.split(":")[1]
+    g["votes"][str(voter)] = None if target == "skip" else int(target)
+    await query.answer("Vote recorded.")
+
+async def end_vote_phase(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    g = store.gget(chat_id)
+    if g["phase"] != "vote":
+        return
+    tally = {}
+    for v, t in g["votes"].items():
+        if t is None:
+            continue
+        tally[t] = tally.get(t, 0) + 1
+    if tally:
+        eliminated = max(tally.items(), key=lambda x: x[1])[0]
+        if eliminated in g["alive"]:
+            g["alive"].remove(eliminated)
+            g["eliminated"].append(eliminated)
+            role = g["roles"].get(eliminated)
+            await context.bot.send_message(chat_id, f"☠️ Player {eliminated} eliminated. ({role.upper()})")
+    else:
+        await context.bot.send_message(chat_id, "No votes cast. No one eliminated.")
+
+    agents = [uid for uid in g["alive"] if g["roles"].get(uid) == "agent"]
+    moles = [uid for uid in g["alive"] if g["roles"].get(uid) == "mole"]
+
+    if not moles:
+        await handle_end_game(context, chat_id, winners="agents")
+        return
+    if len(moles) >= len(agents):
+        await handle_end_game(context, chat_id, winners="moles")
+        return
+
+    # next round
+    g["round"] += 1
+    g["phase"] = "task"
+    g["last_summary"] = ""
+    g["tasks"] = {}
+    for uid in g["alive"]:
+        if g["roles"].get(uid) == "agent":
+            assigned = []
+            for _ in range(2):
+                prompt, answer = gen_task()
+                assigned.append({"id": short_id(), "prompt": prompt, "answer": answer, "done": False})
+            g["tasks"][str(uid)] = {"assigned": assigned}
+            try:
+                await context.bot.send_message(uid,
+                    f"Round {g['round']} — New tasks ({TASK_PHASE_SECONDS}s):\n" +
+                    "\n".join([f"{t['id']}: {t['prompt']}" for t in assigned]) +
+                    "\nReply: /solve <task_id> <answer>"
+                )
+            except:
+                pass
+        else:
+            try:
+                await context.bot.send_message(uid, f"Round {g['round']} — You are MOLE. Use /sabotage once.")
+            except:
+                pass
+    await context.bot.send_message(chat_id, f"➡️ Next Task phase started ({TASK_PHASE_SECONDS}s).")
+    context.job_queue.run_once(end_task_phase, TASK_PHASE_SECONDS, data={"chat_id": chat_id}, name=f"task_{chat_id}_{g['round']}")
+
+# End game handler & reward distribution
+async def handle_end_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winners: str):
+    g = store.gget(chat_id)
+    g["phase"] = "finished"
+    agents_all = [uid for uid,r in g["roles"].items() if r=="agent"]
+    moles_all = [uid for uid,r in g["roles"].items() if r=="mole"]
+    if winners == "agents":
+        winners_list = agents_all
+        losers = moles_all
+        win_text = "Agents win! 🎉"
+    else:
+        winners_list = moles_all
+        losers = agents_all
+        win_text = "Moles win! 🕵️"
+
+    big = is_big_match(len(g["roles"]))
+    reward_msg = []
+    if big:
+        for uid in winners_list:
+            p = store.pget(uid)
+            p["mega"] += MEGA_REWARD_BIG_WIN
+            p["wins"] += 1
+            store.add_global_score(uid, 100)
+        for uid in losers:
+            p = store.pget(uid)
+            p["losses"] += 1
+            store.add_global_score(uid, 10)
+        reward_msg.append(f"Winners received +{MEGA_REWARD_BIG_WIN} Mega each (big match).")
+    else:
+        for uid in winners_list:
+            p = store.pget(uid)
+            p["nano"] += NANO_REWARD_SMALL_WIN
+            p["wins"] += 1
+            store.add_global_score(uid, 60)
+        for uid in losers:
+            p = store.pget(uid)
+            p["nano"] += NANO_REWARD_SMALL_CONSOLE
+            p["losses"] += 1
+            store.add_global_score(uid, 15)
+        reward_msg.append(f"Winners +{NANO_REWARD_SMALL_WIN} Nano | Losers +{NANO_REWARD_SMALL_CONSOLE} Nano (small match).")
+
+    await context.bot.send_message(chat_id, f"🏁 Game Over — {win_text}\n" + "\n".join(reward_msg) +
+                                   f"\n1 Mega = {MEGA_VALUE_IN_NANO} Nano\nUse /balance to check your balance.")
+
+    # reset group
+    g["lobby"] = []
+    g["phase"] = "idle"
+    g["roles"] = {}
+    g["alive"] = []
+    g["eliminated"] = []
+    g["votes"] = {}
+    g["tasks"] = {}
+    g["meeting_caller"] = None
+
+# -----------------
+# Economy commands
+# -----------------
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    p = store.pget(uid)
+    await update.message.reply_text(f"💰 Your Balance:\nNano: {p['nano']}\nMega: {p['mega']}")
+
+# profile (detailed)
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    p = store.pget(u.id)
+    inv_names = [SHOP_ITEMS[i][0] for i in p["inventory"] if i in SHOP_ITEMS]
     await update.message.reply_text(
-        "Commands:\n"
-        "/play – new room\n"
-        "/join CODE – join room\n"
-        f"/place_treasures <{TREASURES_PER_PLAYER} cells>\n"
-        f"/place_traps <{TRAPS_PER_PLAYER} cells>\n"
-        "/ready – done with placement\n"
-        "/guess <cell> – play turn\n"
-        "/status – match status\n"
-        "/ff – resign"
+        f"👤 {mention(u)}\nNano: {p['nano']} | Mega: {p['mega']}\nWins: {p['wins']} | Losses: {p['losses']}\n"
+        f"Characters: {', '.join(inv_names) if inv_names else '—'}"
     )
 
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["🛍️ Shop:"]
+    for iid,(name,price,cur) in SHOP_ITEMS.items():
+        lines.append(f"{iid}: {name} — {price} {cur}")
+    lines.append("Buy: /buy <item_id>")
+    await update.message.reply_text("\n".join(lines))
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /buy <item_id>")
+        return
+    iid = args[0].upper()
+    if iid not in SHOP_ITEMS:
+        await update.message.reply_text("Invalid item id.")
+        return
+    name, price, cur = SHOP_ITEMS[iid]
+    p = store.pget(u.id)
+    if cur == "nano":
+        if p["nano"] < price:
+            await update.message.reply_text("Not enough Nano.")
+            return
+        p["nano"] -= price
+    else:
+        if p["mega"] < price:
+            await update.message.reply_text("Not enough Mega.")
+            return
+        p["mega"] -= price
+    p["inventory"].append(iid)
+    await update.message.reply_text(f"✅ Purchased {name}.")
+
+async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    p = store.pget(u.id)
+    if not p["inventory"]:
+        await update.message.reply_text("Inventory empty.")
+        return
+    lines = ["🎒 Inventory:"]
+    for iid in p["inventory"]:
+        lines.append(f"{iid} — {SHOP_ITEMS.get(iid,('Unknown',0))[0]}")
+    lines.append("Gift: reply to a user message and use /gift <item_id>")
+    await update.message.reply_text("\n".join(lines))
+
+async def gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the recipient's message and use /gift <item_id>")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /gift <item_id>")
+        return
+    iid = args[0].upper()
+    sender = store.pget(u.id)
+    if iid not in sender["inventory"]:
+        await update.message.reply_text("You don't own that item.")
+        return
+    target_id = update.message.reply_to_message.from_user.id
+    receiver = store.pget(target_id)
+    sender["inventory"].remove(iid)
+    receiver["inventory"].append(iid)
+    await update.message.reply_text(f"🎁 Gifted {SHOP_ITEMS[iid][0]} to {receiver.get('username') or target_id}.")
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # simple local/global approximation: sort players by wins*100 + nano + mega*MEGA_VALUE_IN_NANO
+    scores = []
+    for uid_s in store.data["players"].keys():
+        uid = int(uid_s)
+        p = store.pget(uid)
+        score = p["wins"]*100 + p["nano"] + p["mega"]*MEGA_VALUE_IN_NANO
+        scores.append((score, uid))
+    scores.sort(reverse=True)
+    top = scores[:10]
+    lines = ["📊 Top 10 Players:"]
+    for i,(sc, uid) in enumerate(top, start=1):
+        p = store.pget(uid)
+        lines.append(f"{i}. {p.get('username') or uid} — {sc}")
+    await update.message.reply_text("\n".join(lines))
+
+async def globalboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsc = store.data.get("globalscore", {})
+    pairs = [(sc, int(uid)) for uid, sc in gsc.items()]
+    pairs.sort(reverse=True)
+    top = pairs[:10]
+    lines = ["🌍 Global Leaderboard:"]
+    for i,(sc, uid) in enumerate(top, start=1):
+        p = store.pget(uid)
+        lines.append(f"{i}. {p.get('username') or uid} — {sc}")
+    if len(lines)==1:
+        lines.append("No scores yet.")
+    await update.message.reply_text("\n".join(lines))
+
+# Fallback unknown
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command.")
+
+# -----------------
+# Startup & main
+# -----------------
 def main():
+    if BOT_TOKEN.startswith("PASTE") or not BOT_TOKEN:
+        raise SystemExit("Set BOT_TOKEN in the script.")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # game commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("play", play))
-    app.add_handler(CommandHandler("join", join))
-    app.add_handler(CommandHandler("place_treasures", place_treasures))
-    app.add_handler(CommandHandler("place_traps", place_traps))
-    app.add_handler(CommandHandler("ready", ready))
-    app.add_handler(CommandHandler("guess", guess))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("ff", ff))
+    app.add_handler(CommandHandler("host", host))
+    app.add_handler(CommandHandler("join", join_lobby))
+    app.add_handler(CommandHandler("startgame", startgame))
+    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("solve", solve))
+    app.add_handler(CommandHandler("sabotage", sabotage))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("shop", shop))
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("inventory", inventory))
+    app.add_handler(CommandHandler("gift", gift))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("globalboard", globalboard))
 
-    # Ignore all other messages politely
-    app.add_handler(MessageHandler(filters.ALL, lambda u, c: u.message.reply_text("Use commands like /play, /join, /guess B3")))
+    app.add_handler(CallbackQueryHandler(on_vote_button))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # background save loop
+    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(store.save()), interval=SAVE_INTERVAL, first=SAVE_INTERVAL)
+
+    print("Bot started.")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
