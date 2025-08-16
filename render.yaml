@@ -1,8 +1,11 @@
+# render.yaml — deploy Agent vs Mole Telegram bot as a worker on Render
 services:
   - type: worker
-    name: treasure-hunt-bot
+    name: agent-mole-bot
     env: python
     plan: free
+    region: oregon
+    branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
