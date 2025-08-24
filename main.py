@@ -70,6 +70,7 @@ class Store:
                 print("Warning: failed loading data.json — starting fresh.")
 
     async def save_loop(self):
+        # periodic saver
         while True:
             await asyncio.sleep(SAVE_INTERVAL)
             await self.save()
@@ -558,6 +559,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     p = store.pget(uid)
     await update.message.reply_text(f"💰 Your Balance:\nNano: {p['nano']}\nMega: {p['mega']}")
+
 # NEW: Level command (derived from globalscore)
 async def level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -680,10 +682,24 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------
 # Startup & main
 # -----------------
+async def _post_init(app):
+    # start periodic saver as background task (works even if job_queue is None)
+    app.create_task(store.save_loop())
+
+async def _post_shutdown(app):
+    # make sure we flush to disk on shutdown/redeploy
+    await store.save()
+
 def main():
     if BOT_TOKEN.startswith("PASTE") or not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN in the script.")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     # game commands
     app.add_handler(CommandHandler("start", start))
@@ -694,7 +710,7 @@ def main():
     app.add_handler(CommandHandler("solve", solve))
     app.add_handler(CommandHandler("sabotage", sabotage))
     app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("level", level))  # <-- ADDED
+    app.add_handler(CommandHandler("level", level))  # <-- Level command
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("shop", shop))
     app.add_handler(CommandHandler("buy", buy))
@@ -705,9 +721,6 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_vote_button))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    # background save loop
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(store.save()), interval=SAVE_INTERVAL, first=SAVE_INTERVAL)
 
     print("Bot started.")
     app.run_polling()
