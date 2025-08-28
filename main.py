@@ -613,7 +613,63 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p["mega"] -= price
     p["inventory"].append(iid)
     await update.message.reply_text(f"✅ Purchased {name}.")
+# ----------------
+# Coin Transfer Commands
+# ----------------
 
+async def megagive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /megagive <username> <amount>")
+        return
+    
+    username = context.args[0]
+    try:
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Amount must be a number.")
+        return
+
+    sender = str(update.effective_user.id)
+    receiver = username.replace("@", "")
+
+    if sender not in store["users"] or store["users"][sender]["mega"] < amount:
+        await update.message.reply_text("You don’t have enough Mega Coins!")
+        return
+
+    if receiver not in store["users"]:
+        store["users"][receiver] = {"mega": 0, "nano": 0, "level": 1}
+
+    store["users"][sender]["mega"] -= amount
+    store["users"][receiver]["mega"] += amount
+
+    await update.message.reply_text(f"✅ Sent {amount} Mega Coins to @{receiver}!")
+
+async def nanogive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /nanogive <username> <amount>")
+        return
+    
+    username = context.args[0]
+    try:
+        amount = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Amount must be a number.")
+        return
+
+    sender = str(update.effective_user.id)
+    receiver = username.replace("@", "")
+
+    if sender not in store["users"] or store["users"][sender]["nano"] < amount:
+        await update.message.reply_text("You don’t have enough Nano Coins!")
+        return
+
+    if receiver not in store["users"]:
+        store["users"][receiver] = {"mega": 0, "nano": 0, "level": 1}
+
+    store["users"][sender]["nano"] -= amount
+    store["users"][receiver]["nano"] += amount
+
+    await update.message.reply_text(f"✅ Sent {amount} Nano Coins to @{receiver}!")
 async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     p = store.pget(u.id)
