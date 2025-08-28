@@ -735,6 +735,29 @@ async def globalboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unknown command.")
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+start - Start the bot
+host - Host a new lobby
+join - Join an existing lobby
+startgame - Start the hosted game
+report - Report a player
+solve - Solve a task
+sabotage - Sabotage the game
+balance - Check your coin balance
+level - Show your current level
+profile - Show your profile
+shop - Open the shop
+buy - Buy an item from the shop
+inventory - Show your inventory
+gift - Gift an item to another player
+leaderboard - Show the local leaderboard
+globalboard - Show the global leaderboard
+megagive - Give MegaCoins to a player
+nanogive - Give NanoCoins to a player
+"""
+    await update.message.reply_text(help_text)
+
 # -----------------
 # Startup & main
 # -----------------
@@ -776,6 +799,7 @@ def main():
     app.add_handler(CommandHandler("globalboard", globalboard))
     app.add_handler(CommandHandler("megagive", megagive))
     app.add_handler(CommandHandler("nanogive", nanogive))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(on_vote_button))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
