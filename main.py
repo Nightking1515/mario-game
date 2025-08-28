@@ -774,7 +774,8 @@ def main():
     app.add_handler(CommandHandler("gift", gift))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("globalboard", globalboard))
-
+    app.add_handler(CommandHandler("megagive", megagive))
+    app.add_handler(CommandHandler("nanogive", nanogive))
     app.add_handler(CallbackQueryHandler(on_vote_button))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
